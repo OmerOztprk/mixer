@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gerçek Zamanlı Ses Miksleme</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        
+        h1, h2 {
+            color: #333;
+        }
+        
+        .container {
+            background-color: #f9f9f9;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        
+        .control-panel {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        
+        .sound-list {
+            margin-top: 20px;
+        }
+        
+        button {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+            margin-bottom: 10px;
+        }
+        
+        button:hover {
+            background-color: #45a049;
+        }
+        
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        .audio-control {
+            margin-bottom: 15px;
+        }
+        
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+        }
+        
+        .connected {
+            background-color: #dff0d8;
+            color: #3c763d;
+        }
+        
+        .disconnected {
+            background-color: #f2dede;
+            color: #a94442;
+        }
+        
+        .upload-form {
+            margin-top: 20px;
+        }
+        
+        .file-input {
+            margin-bottom: 10px;
+        }
+        
+        .visualizer {
+            width: 100%;
+            height: 100px;
+            background-color: #333;
+            margin-top: 20px;
+            border-radius: 4px;
+        }
+        
+        .volume-control {
+            margin: 15px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Gerçek Zamanlı Ses Miksleme</h1>
+    
+    <div class="container">
+        <div id="connection-status" class="status disconnected">
+            Sunucuya bağlanıyor...
+        </div>
+        
+        <div class="audio-control">
+            <h2>Ses Kontrolü</h2>
+            <button id="play-btn">Oynat</button>
+            <button id="pause-btn">Duraklat</button>
+            
+            <div class="volume-control">
+                <label for="volume">Ana Ses Seviyesi: </label>
+                <input type="range" id="volume" min="0" max="1" step="0.1" value="0.7">
+                <span id="volume-value">0.7</span>
+            </div>
+        </div>
+        
+        <canvas id="visualizer" class="visualizer"></canvas>
+    </div>
+    
+    <div class="container">
+        <h2>Ses Dosyası Yükleme</h2>
+        <div class="upload-form">
+            <div class="file-input">
+                <input type="file" id="audio-file" accept=".wav" />
+            </div>
+            <button id="upload-btn">Yükle</button>
+        </div>
+    </div>
+    
+    <div class="container">
+        <h2>Kullanılabilir Ses Efektleri</h2>
+        <div class="control-panel">
+            <div class="sound-list" id="sound-list">
+                <p>Henüz ses efekti yok</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Ses işleme değişkenleri
+        let audioContext;
+        let scriptNode;
+        let gainNode;
+        let analyser;
+        let websocket;
+        let audioQueue = [];
+        let isPlaying = false;
+        let availableSounds = [];
+        let sampleRate = 44100;
+        let channels = 2;
+        
+        // DOM elemanları
+        const playBtn = document.getElementById('play-btn');
+        const pauseBtn = document.getElementById('pause-btn');
+        const volumeControl = document.getElementById('volume');
+        const volumeValue = document.getElementById('volume-value');
+        const connectionStatus = document.getElementById('connection-status');
+        const uploadBtn = document.getElementById('upload-btn');
+        const audioFileInput = document.getElementById('audio-file');
+        const soundList = document.getElementById('sound-list');
+        const visualizer = document.getElementById('visualizer');
+        const canvasCtx = visualizer.getContext('2d');
+        
+        // WebSocket bağlantısını başlat
+        function initWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}`;
+            
+            websocket = new WebSocket(wsUrl);
+            
+            websocket.onopen = () => {
+                console.log('WebSocket bağlantısı açıldı');
+                connectionStatus.textContent = 'Sunucuya bağlandı';
+                connectionStatus.classList.remove('disconnected');
+                connectionStatus.classList.add('connected');
+            };
+            
+            websocket.onclose = () => {
+                console.log('WebSocket bağlantısı kapandı');
+                connectionStatus.textContent = 'Sunucu bağlantısı kesildi, yeniden bağlanılıyor...';
+                connectionStatus.classList.remove('connected');
+                connectionStatus.classList.add('disconnected');
+                
+                // Bağlantıyı yeniden kurma
+                setTimeout(initWebSocket, 3000);
+            };
+            
+            websocket.onerror = (error) => {
+                console.error('WebSocket hatası:', error);
+            };
+            
+            websocket.onmessage = (event) => {
+                // Binary ses verileri geldi
+                if (event.data instanceof Blob) {
+                    const blob = event.data;
+                    blob.arrayBuffer().then(buffer => {
+                        if (isPlaying) {
+                            processAudioChunk(buffer);
+                        } else {
+                            // Oynatma durduysa veriyi at
+                            console.log('Ses verisi alındı fakat oynatma durdu');
+                        }
+                    });
+                } else {
+                    // JSON mesajlar
+                    try {
+                        const message = JSON.parse(event.data);
+                        handleServerMessage(message);
+                    } catch (e) {
+                        console.error('Mesaj işleme hatası:', e);
+                    }
+                }
+            };
+        }
+        
+        // Ses API'sini başlat
+        function initAudio() {
+            try {
+                window.AudioContext = window.AudioContext || window.webkitAudioContext;
+                audioContext = new AudioContext({
+                    sampleRate: sampleRate,
+                    latencyHint: 'interactive'
+                });
+                
+                // Ana ses seviyesi kontrolü
+                gainNode = audioContext.createGain();
+                gainNode.gain.value = volumeControl.value;
+                
+                // Ses görselleştirici
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                
+                // ScriptProcessorNode oluştur (Web Audio API tarafından PCM verilerini işlemek için)
+                scriptNode = audioContext.createScriptProcessor(4096, 0, channels);
+                scriptNode.onaudioprocess = audioProcessCallback;
+                
+                // Bağlantıları kur
+                scriptNode.connect(gainNode);
+                gainNode.connect(analyser);
+                analyser.connect(audioContext.destination);
+                
+                console.log('Audio API başlatıldı:', audioContext.sampleRate, 'Hz');
+                
+                // UI güncelleme
+                drawVisualizer();
+                
+            } catch (e) {
+                console.error('Audio API başlatma hatası:', e);
+                alert('Tarayıcınız Web Audio API\'yi desteklemiyor veya bir sorun oluştu.');
+            }
+        }
+        
+        // Ses işleme callback'i
+        function audioProcessCallback(e) {
+            // Çıkış buffer'larını al
+            const outputL = e.outputBuffer.getChannelData(0);
+            const outputR = e.outputBuffer.getChannelData(1);
+            
+            // Eğer yeterli veri yoksa sessizlik üret
+            if (audioQueue.length === 0) {
+                outputL.fill(0);
+                outputR.fill(0);
+                return;
+            }
+            
+            // Kuyruktaki ilk buffer'ı al
+            const buffer = audioQueue.shift();
+            const pcmData = new Int16Array(buffer);
+            
+            // 16-bit PCM'i float32'ye dönüştür ve stereo datalardaki kanalları ayır
+            for (let i = 0; i < outputL.length; i++) {
+                if (i * 2 < pcmData.length) {
+                    // Normalize to float (-1.0 to 1.0)
+                    outputL[i] = pcmData[i * 2] / 32768.0;
+                    
+                    if (i * 2 + 1 < pcmData.length) {
+                        outputR[i] = pcmData[i * 2 + 1] / 32768.0;
+                    } else {
+                        outputR[i] = 0;
+                    }
+                } else {
+                    // Yeterli veri yoksa sessizlik
+                    outputL[i] = 0;
+                    outputR[i] = 0;
+                }
+            }
+        }
+        
+        // Ses parçalarını işle ve kuyruğa ekle
+        function processAudioChunk(buffer) {
+            if (!isPlaying) return;
+            
+            // ArrayBuffer'ı kuyruğa ekle
+            audioQueue.push(buffer);
+            
+            // Kuyruk çok uzadıysa en eski verileri at (gecikmeden kaçınmak için)
+            if (audioQueue.length > 5) {
+                console.warn('Ses kuyruğu çok uzun, eski veri atılıyor');
+                audioQueue.shift();
+            }
+        }
+        
+        // Ses oynatmayı başlat
+        function startAudio() {
+            if (isPlaying) return;
+            
+            if (audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+            
+            isPlaying = true;
+            playBtn.disabled = true;
+            pauseBtn.disabled = false;
+            console.log('Ses oynatma başladı');
+        }
+        
+        // Ses oynatmayı duraklat
+        function pauseAudio() {
+            if (!isPlaying) return;
+            
+            isPlaying = false;
+            audioQueue = []; // Kuyruğu temizle
+            playBtn.disabled = false;
+            pauseBtn.disabled = true;
+            console.log('Ses oynatma duraklatıldı');
+        }
+        
+        // Ses efektlerini sunucudan al
+        function fetchAvailableSounds() {
+            fetch('/api/available-sounds')
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Alınan ses listesi:', data);
+                    availableSounds = data.sounds || [];
+                    updateSoundList();
+                })
+                .catch(error => {
+                    console.error('Ses listesini alma hatası:', error);
+                });
+        }
+        
+        // Ses listesini güncelle
+        function updateSoundList() {
+            if (availableSounds.length === 0) {
+                soundList.innerHTML = '<p>Henüz ses efekti yok</p>';
+                return;
+            }
+            
+            soundList.innerHTML = '';
+            availableSounds.forEach(sound => {
+                const button = document.createElement('button');
+                button.textContent = sound.name;
+                button.dataset.path = sound.path;
+                button.addEventListener('click', () => playSoundEffect(sound.path));
+                soundList.appendChild(button);
+            });
+        }
+        
+        // Ses efekti çal
+        function playSoundEffect(soundPath) {
+            if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+                console.error('WebSocket bağlantısı yok');
+                return;
+            }
+            
+            console.log('Çalınacak ses:', soundPath);
+            
+            websocket.send(JSON.stringify({
+                type: 'playSound',
+                soundPath: soundPath,
+                volume: volumeControl.value
+            }));
+        }
+        
+        // Ses dosyası yükleme
+        function uploadAudioFile() {
+            const file = audioFileInput.files[0];
+            if (!file) {
+                alert('Lütfen bir ses dosyası seçin.');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('audio', file);
+            
+            console.log('Dosya yükleniyor:', file.name);
+            
+            fetch('/api/upload-sound', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log('Yükleme sonucu:', data);
+                if (data.success) {
+                    alert('Ses dosyası başarıyla yüklendi!');
+                    audioFileInput.value = '';
+                    
+                    // Ses listesini güncelle
+                    fetchAvailableSounds();
+                } else {
+                    alert('Hata: ' + data.error);
+                }
+            })
+            .catch(error => {
+                console.error('Yükleme hatası:', error);
+                alert('Yükleme sırasında bir hata oluştu.');
+            });
+        }
+        
+        // Audio görselleştirici çiz
+        function drawVisualizer() {
+            if (!analyser) return;
+            
+            const WIDTH = visualizer.width;
+            const HEIGHT = visualizer.height;
+            
+            requestAnimationFrame(drawVisualizer);
+            
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            
+            analyser.getByteFrequencyData(dataArray);
+            
+            canvasCtx.fillStyle = 'rgb(0, 0, 0)';
+            canvasCtx.fillRect(0, 0, WIDTH, HEIGHT);
+            
+            const barWidth = (WIDTH / bufferLength) * 2.5;
+            let barHeight;
+            let x = 0;
+            
+            for (let i = 0; i < bufferLength; i++) {
+                barHeight = dataArray[i] / 2;
+                
+                canvasCtx.fillStyle = `rgb(${barHeight + 100}, 50, 50)`;
+                canvasCtx.fillRect(x, HEIGHT - barHeight, barWidth, barHeight);
+                
+                x += barWidth + 1;
+            }
+        }
+        
+        // Sunucu mesajlarını işle
+        function handleServerMessage(message) {
+            console.log('Sunucu mesajı:', message);
+            
+            if (message.type === 'soundList') {
+                availableSounds = message.sounds || [];
+                updateSoundList();
+            }
+        }
+        
+        // Sayfa yüklendiğinde başlat
+        window.addEventListener('load', () => {
+            // Canvas boyutunu ayarla
+            visualizer.width = visualizer.clientWidth;
+            visualizer.height = visualizer.clientHeight;
+            
+            // WebSocket bağlantısını başlat
+            initWebSocket();
+            
+            // Audio API'yi başlat
+            initAudio();
+            
+            // Kullanılabilir sesleri al
+            setTimeout(fetchAvailableSounds, 1000);
+            
+            // Buton event listener'ları
+            playBtn.addEventListener('click', startAudio);
+            pauseBtn.addEventListener('click', pauseAudio);
+            uploadBtn.addEventListener('click', uploadAudioFile);
+            
+            // Ses kontrolünü ayarla
+            volumeControl.addEventListener('input', () => {
+                const value = parseFloat(volumeControl.value);
+                volumeValue.textContent = value.toFixed(1);
+                
+                if (gainNode) {
+                    gainNode.gain.value = value;
+                }
+            });
+            
+            // İlk UI durumu
+            pauseBtn.disabled = true;
+        });
+        
+        // Sayfadan ayrılırken temizlik
+        window.addEventListener('beforeunload', () => {
+            if (websocket) {
+                websocket.close();
+            }
+            
+            if (audioContext) {
+                audioContext.close();
+            }
+        });
+    </script>
+</body>
+</html>
